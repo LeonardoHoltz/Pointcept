@@ -4,7 +4,7 @@
         "port": "8001"
     },
     "input": {
-        "main_pc": "../data/ascii_NORA_E.pcd"
+        "main_pc": "../data/scannet_scene.pcd"
     },
     "classes": [
         "class0",
