@@ -1,0 +1,15 @@
+.pc-gui {
+  width: 350px !important;
+}
+.pc-gui .controller {
+  font-size: 18px;
+  height: 32px;
+}
+
+.pc-gui .controller .widget .select {
+    height: 900px;
+}
+
+.lil-gui {
+    --widget-height: 30px;
+}

@@ -1,0 +1,22 @@
+{
+    "clustering_api": {
+        "host": "10.167.1.82",
+        "port": "8001"
+    },
+    "input": {
+        "main_pc": "../data/ascii_NORA_E.pcd"
+    },
+    "classes": [
+        "class0",
+        "class1",
+        "class2",
+        "class3",
+        "class4",
+        "class5"
+    ],
+    "non_clustered_classes": [
+        0,
+        1,
+        2
+    ]
+}
