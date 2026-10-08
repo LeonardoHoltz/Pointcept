@@ -140,6 +140,8 @@ class InferenceService:
         with self.lock:
             if kind == "saliency":
                 return self._saliency(header, arrays, data_dict, log)
+            if kind == "ablation":
+                return self._ablation(header, arrays, data_dict, log)
             if kind == "ceteris_paribus":
                 return self._ceteris(header, arrays, data_dict, log)
             return self._predict(header, arrays, data_dict, log)
@@ -197,13 +199,79 @@ class InferenceService:
         spec = header.get("saliency", {})
         mask = self._mask(arrays, data_dict)
         target = spec.get("target_class")
+        method = spec.get("method", "vanilla")
         log(f"  saliency: instance {spec.get('instance')}, "
-            f"{int(mask.sum()):,} masked points, target class {target}")
+            f"{int(mask.sum()):,} masked points, target class {target}, method {method}")
 
         values = self.engine.saliency(
-            data_dict, mask, target_class=target, mode=self.saliency_mode
+            data_dict, mask, target_class=target, mode=self.saliency_mode,
+            method=method, baseline=spec.get("baseline", "noise"),
+            steps=int(spec.get("steps", 16)),
         )
-        return encode({"saliency": values}, num_points=int(values.shape[0]))
+        return encode(
+            {"saliency": values},
+            num_points=int(values.shape[0]),
+            method=method,
+        )
+
+    # -- ablation --------------------------------------------------------
+
+    def _ablation(self, header, arrays, data_dict, log):
+        """Two heatmaps, their difference, and what the object becomes without
+        the points that argued hardest for A."""
+        spec = header.get("ablation", {})
+        mask = self._mask(arrays, data_dict)
+        class_a = int(spec["class_a"])
+        class_b = int(spec["class_b"])
+        remove = int(spec.get("remove", 0))
+        method = spec.get("method", "deeplift")
+        log(f"  ablation: instance {spec.get('instance')}, {int(mask.sum()):,} masked "
+            f"points, {self._name(class_a)} vs {self._name(class_b)}, "
+            f"removing {remove}, method {method}")
+
+        # Default to attributing over *both* inputs, not the server's saliency
+        # default. Removing a point takes away its position as well as its
+        # colour, so ranking it by a colour-only gradient answers a different
+        # question than the ablation asks -- measured: a feat-only ranking
+        # removed points no more damaging than the opposite ranking did.
+        out = self.engine.ablation(
+            data_dict, mask, class_a, class_b, remove=remove,
+            mode=spec.get("input", "both"), method=method,
+            baseline=spec.get("baseline", "noise"), steps=int(spec.get("steps", 16)),
+        )
+
+        before, after = out["before"], out["after"]
+        log(f"    before: {self._name(class_a)} {before['per_class'][out['class_a']]:.3f} / "
+            f"{self._name(class_b)} {before['per_class'][out['class_b']]:.3f} "
+            f"-> majority {self._name(before['label'])}")
+        if after:
+            log(f"    after:  {self._name(class_a)} {after['per_class'][out['class_a']]:.3f} / "
+                f"{self._name(class_b)} {after['per_class'][out['class_b']]:.3f} "
+                f"-> majority {self._name(after['label'])}")
+
+        return encode(
+            {
+                "attribution_a": out["attribution_a"],
+                "attribution_b": out["attribution_b"],
+                "attribution_diff": out["attribution_diff"],
+                "removed": out["removed"].astype(np.int64),
+            },
+            num_points=int(data_dict["coord"].shape[0]),
+            classes=self.classes,
+            class_names=self.class_names,
+            ablation={
+                "class_a": out["class_a"], "class_b": out["class_b"],
+                "object_points": out["object_points"], "removed": int(out["removed"].size),
+                "method": method, "before": before, "after": after,
+            },
+        )
+
+    def _name(self, value):
+        if isinstance(self.class_names, dict):
+            return self.class_names.get(int(value), f"class {value}")
+        if isinstance(self.class_names, (list, tuple)) and 0 <= int(value) < len(self.class_names):
+            return self.class_names[int(value)]
+        return f"class {value}"
 
     # -- shared ----------------------------------------------------------
 
