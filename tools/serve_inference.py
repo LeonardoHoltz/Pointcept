@@ -199,7 +199,7 @@ class InferenceService:
         spec = header.get("saliency", {})
         mask = self._mask(arrays, data_dict)
         target = spec.get("target_class")
-        method = spec.get("method", "vanilla")
+        method = spec.get("method", "input_x_gradient")
         log(f"  saliency: instance {spec.get('instance')}, "
             f"{int(mask.sum()):,} masked points, target class {target}, method {method}")
 
@@ -262,7 +262,7 @@ class InferenceService:
             ablation={
                 "class_a": out["class_a"], "class_b": out["class_b"],
                 "object_points": out["object_points"], "removed": int(out["removed"].size),
-                "method": method, "before": before, "after": after,
+                "method": out.get("method", method), "before": before, "after": after,
             },
         )
 

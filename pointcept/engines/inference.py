@@ -329,10 +329,16 @@ class InferenceEngine:
     #: grey and for coordinates is the canonical frame's centre.
     BASELINES = ("noise", "zeros")
 
-    #: vanilla     input x gradient -- no reference at all
-    #: deeplift    (input - reference) x gradient
-    #: integrated  the path integral of the gradient from reference to input
-    METHODS = ("vanilla", "deeplift", "integrated")
+    #: gradient          the raw gradient, d score / d input -- no input factor
+    #: input_x_gradient  the gradient times the input itself
+    #: deeplift          the gradient times (input - reference)
+    #: integrated        the path integral of the gradient, reference -> input
+    METHODS = ("gradient", "input_x_gradient", "deeplift", "integrated")
+
+    #: `vanilla` named the input-times-gradient method before the two were told
+    #: apart; requests still using it mean that one.
+    ALIASES = {"vanilla": "input_x_gradient", "inputxgradient": "input_x_gradient",
+               "grad": "gradient", "ig": "integrated"}
 
     def _reference(self, tensor, baseline, seed=0):
         """The reference input a method measures against, shaped like `tensor`."""
@@ -382,10 +388,17 @@ class InferenceEngine:
 
         `method`:
 
-        vanilla
-            input x gradient. No reference: the attribution is about the input's
-            own magnitude, which is why a dark point can look unimportant simply
-            for being dark.
+        gradient
+            the raw gradient, d score / d input. Sensitivity alone: how much the
+            score would move if this point's input moved, saying nothing about
+            what the input actually is.
+
+        input_x_gradient
+            the gradient times the input. Sensitivity weighted by the signal
+            that is there -- which is also why a point whose features are near
+            zero scores near zero however sensitive the model is to it. (This is
+            what `vanilla` used to mean here; the two are not the same thing and
+            are now separate.)
 
         deeplift
             (input - reference) x gradient, the Rescale rule's single-reference
@@ -404,13 +417,16 @@ class InferenceEngine:
         """
         if mode not in ("feat", "coord", "both"):
             raise ValueError(f"unknown attribution input {mode!r}")
+        method = self.ALIASES.get(method, method)
         if method not in self.METHODS:
-            raise ValueError(f"unknown attribution method {method!r}")
+            raise ValueError(
+                f"unknown attribution method {method!r}; expected one of {', '.join(self.METHODS)}")
 
         input_dict = self.prepare(canonical)
         tracked = self._tracked_inputs(input_dict, mode)
+        needs_reference = method in ("deeplift", "integrated")
         references = {
-            key: (None if method == "vanilla" else self._reference(x, baseline, seed))
+            key: (self._reference(x, baseline, seed) if needs_reference else None)
             for key, x in tracked
         }
         inputs = {key: x for key, x in tracked}
@@ -447,8 +463,12 @@ class InferenceEngine:
                 for (key, x), g in zip(tracked, grads):
                     if g is None:
                         continue
-                    delta = x if method == "vanilla" else (x - references[key])
-                    parts.append(g * delta)
+                    if method == "gradient":
+                        parts.append(g)                       # no input factor at all
+                    elif method == "input_x_gradient":
+                        parts.append(g * x)
+                    else:
+                        parts.append(g * (x - references[key]))
 
         if not parts:
             raise ValueError(
@@ -466,7 +486,7 @@ class InferenceEngine:
 
     def saliency(
         self, data_dict, mask, target_class=None, mode="feat",
-        method="vanilla", baseline="noise", steps=16,
+        method="input_x_gradient", baseline="noise", steps=16,
     ):
         """
         How much each point moved the model's opinion about one object.
@@ -525,6 +545,8 @@ class InferenceEngine:
         changes the voxel grid and pretending otherwise would score a cloud the
         model was never given.
         """
+        # Resolve an alias once, here, so what comes back names what actually ran.
+        method = self.ALIASES.get(method, method)
         sel = np.asarray(mask).astype(bool).reshape(-1)
         object_idx = np.flatnonzero(sel)
         if object_idx.size == 0:
@@ -561,6 +583,7 @@ class InferenceEngine:
             after = self._object_probs(logits_after, sel[keep], (cls_a, cls_b))
 
         return {
+            "method": method,
             "attribution_a": attr_a,
             "attribution_b": attr_b,
             "attribution_diff": diff.astype(np.float32),
