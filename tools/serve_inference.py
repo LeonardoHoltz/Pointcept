@@ -23,6 +23,7 @@ Author: written for the pc-seg-interpretability viewer.
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -32,6 +33,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 import pointcept.models  # noqa: F401 -- importing registers every backbone
+import torch
+
 from pointcept.engines.inference import InferenceEngine, arrays_to_data_dict
 from pointcept.utils.config import Config
 from pointcept.utils.logger import get_root_logger
@@ -122,17 +125,158 @@ def _softmax(x):
     return e / e.sum(axis=-1, keepdims=True)
 
 
+class ModelCatalogue:
+    """
+    The models this service is allowed to load, read from a JSON file.
+
+    A model's **class names travel with it**. The width of the head is intrinsic
+    -- a 20-class model answers with 20 logits whatever anyone configures -- but
+    what index 4 *means* is not in the checkpoint, and two label spaces of the
+    same width disagree about it. So each entry names its own, and switching
+    model switches the legend with it rather than leaving the old names over new
+    numbers.
+
+    `config` and `weight` are relative to the pointcept checkout (the service's
+    working directory); `classNames` to the repo root above it.
+    """
+
+    def __init__(self, path, repo_root=None):
+        self.path = os.path.abspath(path)
+        self.repo_root = repo_root or os.path.dirname(os.getcwd())
+        self._read()                      # fail at startup if the file is wrong
+
+    def _read(self):
+        """
+        Re-read on every use.
+
+        The file is a few hundred bytes and the service is long-lived: adding a
+        checkpoint or fixing a wrong config should not cost a restart and a
+        minute of reloading the current model. Same reasoning as the viewer's
+        classes.json, which is also read per request.
+        """
+        with open(self.path) as fh:
+            doc = json.load(fh)
+        entries = doc.get("models") or {}
+        if not entries:
+            raise ValueError(f"{self.path} lists no models")
+        default = doc.get("default") or next(iter(entries))
+        if default not in entries:
+            raise ValueError(f"default model {default!r} is not in {self.path}")
+        return entries, default
+
+    @property
+    def entries(self):
+        return self._read()[0]
+
+    @property
+    def default(self):
+        return self._read()[1]
+
+    def __contains__(self, model_id):
+        return model_id in self.entries
+
+    def resolve(self, model_id):
+        """A model's entry, with its paths made absolute and checked."""
+        entries = self.entries
+        if model_id not in entries:
+            raise ValueError(
+                f"unknown model {model_id!r}; this service offers "
+                f"{', '.join(sorted(entries))}")
+        spec = dict(entries[model_id])
+        spec["id"] = model_id
+        spec["config"] = os.path.abspath(spec["config"])
+        if not os.path.exists(spec["config"]):
+            raise ValueError(f"model {model_id!r}: no config at {spec['config']}")
+        for key, base in (("weight", os.getcwd()), ("classNames", self.repo_root)):
+            value = spec.get(key)
+            if not value:
+                continue
+            resolved = value if os.path.isabs(value) else os.path.join(base, value)
+            if not os.path.exists(resolved):
+                raise ValueError(f"model {model_id!r}: no {key} at {resolved}")
+            spec[key] = resolved
+        return spec
+
+    def listing(self, active=None):
+        entries = self.entries
+        return [
+            {
+                "id": key,
+                "name": spec.get("name", key),
+                "description": spec.get("description"),
+                "weighted": bool(spec.get("weight")),
+                "active": key == active,
+            }
+            for key, spec in entries.items()
+        ]
+
+
 class InferenceService:
     """Turns a decoded request into a reply body. Transport-agnostic."""
 
-    def __init__(self, engine, class_names=None, saliency_mode="feat"):
+    def __init__(self, engine, class_names=None, saliency_mode="feat",
+                 catalogue=None, model_id=None, device=None, grid_size=None):
         self.engine = engine
         self.class_names = class_names
         self.saliency_mode = saliency_mode
         self.classes = list(range(engine.num_classes))
+        self.catalogue = catalogue
+        self.model_id = model_id
+        self._device = device
+        self._grid_size = grid_size
         # One model, one CUDA context: serialise the actual work even though the
         # server accepts connections concurrently.
         self.lock = threading.Lock()
+
+    # -- models ----------------------------------------------------------
+
+    def describe(self):
+        return {
+            "service": "pointcept-inference",
+            "model": self.model_id,
+            "num_classes": self.engine.num_classes,
+            "device": str(self.engine.device),
+            "class_names": self.class_names,
+        }
+
+    def load_model(self, model_id, log=print):
+        """
+        Swaps the served model.
+
+        The new one is built *before* the old is let go, so a bad config or a
+        missing checkpoint leaves the service exactly as it was rather than
+        taking it down -- the error goes back to the caller and the previous
+        model keeps answering. Only once the new engine exists does the old one
+        get dropped and its memory returned.
+        """
+        if self.catalogue is None:
+            raise ValueError("this service was started without a model catalogue")
+        spec = self.catalogue.resolve(model_id)
+
+        with self.lock:
+            if model_id == self.model_id:
+                return self.describe()
+
+            log(f"  loading {model_id} ({spec.get('name', model_id)})")
+            cfg = Config.fromfile(spec["config"])
+            fresh = InferenceEngine(cfg, weight=spec.get("weight"),
+                                    device=self._device, grid_size=self._grid_size)
+            names = load_class_names(spec.get("classNames"), fresh.num_classes)
+            if names is None:
+                names = fallback_class_names(cfg, fresh.num_classes)
+
+            previous = self.engine
+            self.engine = fresh
+            self.class_names = names
+            self.classes = list(range(fresh.num_classes))
+            self.model_id = model_id
+
+            del previous
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            log(f"  now serving {model_id}: {fresh.num_classes} classes on {fresh.device}")
+            return self.describe()
 
     def handle(self, header, arrays, log):
         kind = header.get("request") or "predict"
@@ -294,6 +438,12 @@ def make_handler(service, quiet=False):
             length = int(self.headers.get("content-length", 0))
             payload = self.rfile.read(length)
             started = time.time()
+
+            # /models takes JSON, not a point cloud: a different kind of request
+            # on a different path, so neither has to sniff the other's body.
+            if self.path.rstrip("/").endswith("/models"):
+                return self._switch_model(payload)
+
             try:
                 header, arrays = decode(payload)
                 body = service.handle(header, arrays, self._log)
@@ -309,18 +459,47 @@ def make_handler(service, quiet=False):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self):
-            # A liveness probe, so the endpoint can be checked from a browser.
-            body = json.dumps({
-                "service": "pointcept-inference",
-                "num_classes": service.engine.num_classes,
-                "device": str(service.engine.device),
-            }).encode()
-            self.send_response(200)
+        def _json(self, status, doc):
+            body = json.dumps(doc).encode()
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _switch_model(self, payload):
+            """POST /models {"model": "<id>"} -- load it and serve it from now on."""
+            try:
+                wanted = json.loads(payload or b"{}").get("model")
+            except json.JSONDecodeError as err:
+                return self._json(400, {"error": f"malformed JSON: {err}"})
+            if not wanted:
+                return self._json(400, {"error": "give a model id as {\"model\": \"...\"}"})
+            started = time.time()
+            self._log(f"POST /models -> {wanted}")
+            try:
+                state = service.load_model(wanted, log=self._log)
+            except Exception as err:  # noqa: BLE001 -- the viewer shows this text
+                traceback.print_exc()
+                # The previous model is still loaded and still answering.
+                return self._json(400, {"error": f"{type(err).__name__}: {err}",
+                                        "model": service.model_id})
+            self._log(f"  switched in {time.time() - started:.1f}s")
+            return self._json(200, state)
+
+        def do_GET(self):
+            # /models is the catalogue; / is a liveness probe, so the endpoint
+            # can be checked from a browser.
+            if self.path.rstrip("/").endswith("/models"):
+                if service.catalogue is None:
+                    return self._json(200, {"models": [], "active": service.model_id,
+                                            "error": "no catalogue configured"})
+                return self._json(200, {
+                    "active": service.model_id,
+                    "models": service.catalogue.listing(service.model_id),
+                    **service.describe(),
+                })
+            return self._json(200, service.describe())
 
         def _log(self, message):
             if not quiet:
@@ -334,7 +513,9 @@ def make_handler(service, quiet=False):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--config-file", required=True, help="Pointcept config, as for tools/test.py")
+    ap.add_argument("--config-file", default=None,
+                    help="Pointcept config, as for tools/test.py. Optional when --models "
+                         "supplies one")
     ap.add_argument("--weight", default=None, help="checkpoint to serve")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8500)
@@ -350,7 +531,26 @@ def main():
                     help="what saliency is taken with respect to (default: the input features)")
     ap.add_argument("--options", nargs="+", action="append", default=None,
                     help="config overrides, e.g. --options data.num_classes=20")
+    ap.add_argument("--models", default=None,
+                    help="JSON catalogue of loadable models; enables GET/POST /models. "
+                         "With --model, picks which of them to start on")
+    ap.add_argument("--model", default=None,
+                    help="id from --models to load at startup (default: the file's own)")
     args = ap.parse_args()
+
+    # A catalogue can supply the config, weight and class names, so --config-file
+    # and friends become the override rather than the only way in.
+    catalogue = ModelCatalogue(args.models) if args.models else None
+    model_id = None
+    if catalogue is not None and (args.model or not args.config_file):
+        model_id = args.model or catalogue.default
+        spec = catalogue.resolve(model_id)
+        args.config_file = spec["config"]
+        args.weight = args.weight or spec.get("weight")
+        args.class_names = args.class_names or spec.get("classNames")
+
+    if not args.config_file:
+        ap.error("give --config-file, or --models with a catalogue that supplies one")
 
     cfg = Config.fromfile(args.config_file)
     if args.options:
@@ -370,7 +570,11 @@ def main():
     if names is None:
         names = fallback_class_names(cfg, engine.num_classes)
 
-    service = InferenceService(engine, class_names=names, saliency_mode=args.saliency_input)
+    service = InferenceService(
+        engine, class_names=names, saliency_mode=args.saliency_input,
+        catalogue=catalogue, model_id=model_id,
+        device=args.device, grid_size=args.grid_size,
+    )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(service))
 
     print(f"pointcept inference service on http://{args.host}:{args.port}", flush=True)
@@ -383,6 +587,10 @@ def main():
     print(f"  grid size  {engine.grid_size}", flush=True)
     print(f"  mode       one forward pass per scene, raw logits "
           f"(no fragments, no TTA)", flush=True)
+    if catalogue is not None:
+        print(f"  models     {len(catalogue.entries)} in {catalogue.path}"
+              + (f", serving {model_id}" if model_id else "")
+              + " -- GET/POST /models", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

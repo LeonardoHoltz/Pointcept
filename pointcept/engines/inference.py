@@ -491,9 +491,13 @@ class InferenceEngine:
         """
         How much each point moved the model's opinion about one object.
 
-        The magnitude of `attribute` above, normalised to 0..1 -- the viewer
-        colours by it, so only the shape of the field matters, and normalising
-        makes one scene's ramp comparable to the next.
+        `attribute` above, normalised to -1..1 by the largest magnitude present.
+
+        **Signed**, deliberately. A point that pushes the model away from the
+        class is not the same as a point it ignores, and an absolute value calls
+        them both zero. The viewer colours this with a diverging ramp centred on
+        nothing; normalising by the peak makes one scene's ramp comparable to
+        the next without changing where zero sits.
         """
         sel = np.asarray(mask).astype(bool).reshape(-1)
         if sel.sum() == 0:
@@ -508,8 +512,7 @@ class InferenceEngine:
             canonical, meta, in_object, target_class=target_class,
             mode=mode, method=method, baseline=baseline, steps=steps,
         )
-        out = np.abs(values)
-        peak = float(out.max())
+        peak = float(np.abs(values).max())
         if peak == 0.0:
             # Silently handing back a flat field would look like "this object
             # depends on nothing"; almost always it means the score simply has no
@@ -520,7 +523,7 @@ class InferenceEngine:
                 f"{'coord' if mode == 'feat' else 'both'}, or check that the "
                 f"chosen target class is actually produced by the head."
             )
-        return out / peak
+        return values / peak
 
     # -- ablation ----------------------------------------------------------
 
